@@ -1,7 +1,7 @@
 #pragma once
 
-// Plans the in-memory MDGG0001 images of a Qwen3.8 target read straight from a
-// llama.cpp GGUF: section offsets, the bytes the CPU fills (header, descriptors,
+// Plans the in-memory MDGG0001 images of a Qwen3.8 or Qwen3.6-MoE target read
+// straight from a llama.cpp GGUF: section offsets, the bytes the CPU fills (header, descriptors,
 // norms, convolution, decay, time bias, alpha/beta) and the GPU repacks/copies
 // that move quantized rows into 256-column tiles. Layout: 16-byte header
 // (magic, layer, type), then 16 KiB-aligned sections; each quantized tensor is a
@@ -21,6 +21,7 @@ inline constexpr uint64_t kSectionAlignment = 16384;
 inline constexpr char kImageMagic[9] = "MDGG0001";
 
 struct TargetGeometry {
+  std::string architecture = "qwen35";  // GGUF general.architecture and key prefix
   uint32_t layers = 64;
   uint32_t hiddenSize = 5120;
   uint32_t vocabularySize = 248320;
@@ -32,9 +33,15 @@ struct TargetGeometry {
   uint32_t attentionWidth = 6144;
   uint32_t attentionHeadDimension = 256;
   uint32_t fullAttentionPeriod = 4;
+  // Sparse MoE FFN when experts > 0 (intermediateSize is then unused): routed
+  // experts plus one shared expert of expertIntermediateSize.
+  uint32_t experts = 0;
+  uint32_t expertsPerToken = 0;
+  uint32_t expertIntermediateSize = 0;
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
     return (layer + 1) % fullAttentionPeriod == 0;
   }
+  [[nodiscard]] bool moe() const noexcept { return experts != 0; }
 };
 
 struct Fill {

@@ -387,12 +387,16 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
       descriptor = qwen38Descriptor(model);
       validateQwen38(manifest, root, descriptor);
     } else if (format == "gguf") {
-      descriptor = qwen38Descriptor(model);
+      // The manifest's model name selects the architecture the GGUF must hold.
+      const bool moe = model == "Qwen3.6-35B-A3B";
+      if (!moe && model != "Qwen3.8-27B")
+        throw std::invalid_argument("GGUF targets are supported for Qwen3.8-27B and Qwen3.6-35B-A3B, not " + model);
+      descriptor = moe ? qwen36Descriptor(model) : qwen38Descriptor(model);
       requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
                    3, "schema_version");
       validateCommonFormat(requireObject(manifest, @"format", "model weight format"),
                            kGgufImageMagic);
-      validateTokenizer(root, descriptor, "qwen3_5_text");
+      validateTokenizer(root, descriptor, moe ? "qwen3_5_moe_text" : "qwen3_5_text");
       descriptor.ggufTarget = true;
     } else if (format == "splash-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);

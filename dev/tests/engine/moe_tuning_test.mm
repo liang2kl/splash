@@ -269,7 +269,7 @@ void nativeMeasurement(const char *library) {
         experts(backend, 4, salt), experts(backend, 4, salt + 1),
         experts(backend, 4, salt + 2), experts(backend, 1, salt + 3),
         experts(backend, 1, salt + 4), experts(backend, 1, salt + 5),
-        router(backend, true, representative)});
+        router(backend, true, representative), {}});
   }
   const uint64_t modelBytes = backend.memoryStats().allocatedBytes;
   MeasurementOptions options;

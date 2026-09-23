@@ -96,6 +96,7 @@ struct Qwen3_6MoeWeights final {
 [[nodiscard]] Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
+                      bool ggufTarget,
                       Qwen3_6MoeLayout layout = {});
 
 } // namespace splash::model

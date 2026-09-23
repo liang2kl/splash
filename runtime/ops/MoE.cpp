@@ -2,6 +2,8 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/MoE.h"
+#include "metal/abi/Gguf.h"
+#include <string>
 
 #include <cstddef>
 #include <stdexcept>
@@ -40,9 +42,28 @@ bool matches(const ExpertQ4Projection &projection, uint32_t experts,
   return uint64_t{experts - 1} <= (available - payloadBytes) / stride;
 }
 
+bool matches(const GgufExpertProjection &p, uint32_t experts, uint32_t outputSize, uint32_t inputSize) {
+  return p.experts == experts && p.outputSize == outputSize && p.inputSize == inputSize && p.segment.plane0 &&
+         p.segment.meta;
+}
+
 void validate(const MoeWeights &weights, MoeShape shape) {
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
+  if (weights.gguf) {
+    const MoeGgufWeights &g = *weights.gguf;
+    // moe_route_scores_bf16 scores 32 experts per threadgroup straight from the bf16 router rows.
+    if (!shape.valid() || shape.experts % 32 != 0 || g.router.sizeBytes() < uint64_t{shape.experts} * hidden * 2 ||
+        g.sharedGate.sizeBytes() < uint64_t{hidden} * 4 ||
+        !matches(g.expertGate, shape.experts, intermediate, hidden) ||
+        !matches(g.expertUp, shape.experts, intermediate, hidden) ||
+        !matches(g.expertDown, shape.experts, hidden, intermediate) ||
+        !matches(g.sharedExpertGate, 1, intermediate, hidden) ||
+        !matches(g.sharedExpertUp, 1, intermediate, hidden) ||
+        !matches(g.sharedExpertDown, 1, hidden, intermediate))
+      throw std::invalid_argument("GGUF MoE weights do not match execution shape");
+    return;
+  }
   if (!shape.valid() || !matches(weights.router, 256, hidden) ||
       !matches(weights.sharedExpertGate, 256, hidden) ||
       !matches(weights.expertGate, shape.experts, intermediate, hidden) ||
@@ -143,19 +164,30 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
-  graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
-                            : "moe_route_scores_q8_m32",
-            {buffers.input, weights.router.weights, weights.router.scales,
-             weights.router.biases, buffers.groupedInput},
-            routeParams,
-            {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
-  graph.add("moe_route_select_q8",
-            {buffers.groupedInput, buffers.input,
-             weights.sharedExpertGate.weights,
-             weights.sharedExpertGate.scales,
-             weights.sharedExpertGate.biases, buffers.selectedExperts,
-             buffers.routingWeights},
-            routeParams, {rows, 1, 1});
+  if (weights.gguf) {
+    // f32 scores [rows][256] in the grouped-input scratch (the Q8 path stores bf16 there).
+    graph.add("moe_route_scores_bf16",
+              {buffers.input, weights.gguf->router, buffers.groupedInput}, routeParams,
+              {(rows + 7) / 8, (shape.experts + 31) / 32, 1}, {32, 1, 1});
+    graph.add("moe_route_select_f32",
+              {buffers.groupedInput, buffers.input, weights.gguf->sharedGate,
+               buffers.selectedExperts, buffers.routingWeights},
+              routeParams, {rows, 1, 1});
+  } else {
+    graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
+                              : "moe_route_scores_q8_m32",
+              {buffers.input, weights.router.weights, weights.router.scales,
+               weights.router.biases, buffers.groupedInput},
+              routeParams,
+              {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
+    graph.add("moe_route_select_q8",
+              {buffers.groupedInput, buffers.input,
+               weights.sharedExpertGate.weights,
+               weights.sharedExpertGate.scales,
+               weights.sharedExpertGate.biases, buffers.selectedExperts,
+               buffers.routingWeights},
+              routeParams, {rows, 1, 1});
+  }
   graph.add("moe_group_routes",
             {buffers.selectedExperts, buffers.tileDescriptors,
              buffers.tileCount, buffers.groupedRoutes, buffers.routeRows},
@@ -168,6 +200,43 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             MoeGatherParams{tileRows, shape.hiddenSize, shape.routesPerToken()},
             {tiles, shape.hiddenSize / 256, 1});
 
+  if (weights.gguf) {
+    // GGUF experts: fused gate/up then down, 8- or 32-row tiles, 64 output columns per threadgroup
+    // (metal/kernels/shared/gguf_linear.metal). Formats are runtime ids per projection.
+    const MoeGgufWeights &g = *weights.gguf;
+    const auto plane1 = [](const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
+    const auto strides = [](const GgufExpertProjection &p, uint64_t *out) {
+      out[0] = p.plane0Stride; out[1] = p.plane1Stride; out[2] = p.metaStride; };
+    GgufMoeParams gateUp{shape.hiddenSize, shape.expertIntermediateSize, shape.experts,
+                         g.expertGate.segment.formatId, g.expertUp.segment.formatId,
+                         g.sharedExpertGate.segment.formatId, g.sharedExpertUp.segment.formatId, 0, {}, {}};
+    strides(g.expertGate, gateUp.stride_a);
+    strides(g.expertUp, gateUp.stride_b);
+    GgufMoeParams down{shape.expertIntermediateSize, shape.hiddenSize, shape.experts,
+                       g.expertDown.segment.formatId, 0, g.sharedExpertDown.segment.formatId, 0, 0, {}, {}};
+    strides(g.expertDown, down.stride_a);
+    const std::string rowsSuffix = "_m" + std::to_string(tileRows);
+    graph.add("gguf_moe_gateup" + rowsSuffix,
+              {buffers.groupedInput, buffers.tileDescriptors, buffers.tileCount,
+               g.expertGate.segment.plane0, plane1(g.expertGate.segment), g.expertGate.segment.meta,
+               g.expertUp.segment.plane0, plane1(g.expertUp.segment), g.expertUp.segment.meta,
+               g.sharedExpertGate.segment.plane0, plane1(g.sharedExpertGate.segment), g.sharedExpertGate.segment.meta,
+               g.sharedExpertUp.segment.plane0, plane1(g.sharedExpertUp.segment), g.sharedExpertUp.segment.meta,
+               buffers.expertIntermediate},
+              gateUp, {shape.expertIntermediateSize / 64, tiles, 1}, {64, 1, 1});
+    graph.add("gguf_moe_down" + rowsSuffix,
+              {buffers.expertIntermediate, buffers.tileDescriptors, buffers.tileCount,
+               g.expertDown.segment.plane0, plane1(g.expertDown.segment), g.expertDown.segment.meta,
+               g.sharedExpertDown.segment.plane0, plane1(g.sharedExpertDown.segment), g.sharedExpertDown.segment.meta,
+               buffers.expertOutput},
+              down, {shape.hiddenSize / 64, tiles, 1}, {64, 1, 1});
+    graph.add("moe_combine",
+              {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
+               buffers.residual, buffers.output},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
+              {rows, shape.hiddenSize / 256, 1});
+    return;
+  }
   // The two expert strides are the gate and up slabs of the fused tile; a
   // single-matrix pass reads only the first, so its params repeat one stride.
   const MoeExpertParams gateUp{shape.hiddenSize, shape.expertIntermediateSize,

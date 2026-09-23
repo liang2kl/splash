@@ -50,6 +50,7 @@ static_assert(sizeof(GgufPermuteParams) == 12, "GGUF permute parameters are 12 b
 #define GGUF_FMT_Q3K 5u
 #define GGUF_FMT_Q80 6u
 #define GGUF_FMT_IQ3S 7u
+#define GGUF_FMT_F16 8u   // fp16 plane, 64 bytes per 32 weights (F32/F16/BF16 sources)
 
 // Load-time repack of native GGUF rows into the MDGG0001 planes (gguf_repack):
 // one thread per (destination row, 32-wide K group).
@@ -66,8 +67,24 @@ struct GgufRepackParams {
   uint32_t permute_head_rows;   // rows per head
   uint32_t permute_group_heads; // heads per key group (tiled index = group * this + head)
   uint32_t permute_groups;      // value heads per key head
+  uint32_t src_type;            // ggml type of the source rows for the F16 plane (0 F32, 1 F16, 30 BF16)
 };
-static_assert(sizeof(GgufRepackParams) == 48, "GGUF repack parameters are 48 bytes on both sides");
+static_assert(sizeof(GgufRepackParams) == 52, "GGUF repack parameters are 52 bytes on both sides");
+// MoE expert passes over grouped tiles (metal/abi/MoE.h): expert e's planes start at e * stride; the tile whose
+// expert id equals `experts` is the shared expert, which has its own planes and formats.
+struct GgufMoeParams {
+  uint32_t input_size;   // K
+  uint32_t output_size;  // N of one expert
+  uint32_t experts;      // routed experts
+  uint32_t fmt_a;        // routed format of the first (or only) projection
+  uint32_t fmt_b;        // routed format of the second projection (gate/up pass)
+  uint32_t shared_fmt_a;
+  uint32_t shared_fmt_b;
+  uint32_t reserved;
+  uint64_t stride_a[3];  // per-expert plane0, plane1, meta bytes of the first projection
+  uint64_t stride_b[3];
+};
+static_assert(sizeof(GgufMoeParams) == 80, "GGUF MoE parameters are 80 bytes on both sides");
 
 struct GgufCopyParams {
   uint32_t src_offset;

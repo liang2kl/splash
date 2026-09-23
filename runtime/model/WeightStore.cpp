@@ -304,6 +304,7 @@ const char *ggufFormatName(uint32_t type) {
     case 11: return "q3k";
     case 8: return "q80";
     case 21: return "iq3s";
+    case 1: return "f16";
     default: throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(type));
     }
 }
@@ -341,9 +342,26 @@ ops::GgufSegment readGgufSegment(WeightFile &file, std::string_view label) {
     s.format = ggufFormatName(d.type);
     switch (d.type) {
     case 12: s.formatId = 0; break; case 23: s.formatId = 1; break; case 20: s.formatId = 2; break; case 13: s.formatId = 3; break;
-    case 14: s.formatId = 4; break; case 11: s.formatId = 5; break; case 8: s.formatId = 6; break; default: s.formatId = 7; break;
+    case 14: s.formatId = 4; break; case 11: s.formatId = 5; break; case 8: s.formatId = 6; break; case 1: s.formatId = 8; break;
+    default: s.formatId = 7; break;
     }
     return s;
+}
+
+ops::GgufExpertProjection readGgufExpertProjection(WeightFile &file, uint32_t experts, std::string_view label) {
+    if (!experts) throw WeightStoreError("expert projection requires experts");
+    ops::GgufExpertProjection p;
+    p.segment = readGgufSegment(file, label);
+    if (p.segment.outputSize % experts || (p.segment.outputSize / experts) % kQ4StorageN)
+        throw WeightStoreError("GGUF expert rows are not whole 256-row tiles per expert: " + std::string(label));
+    p.experts = experts;
+    p.outputSize = p.segment.outputSize / experts;
+    p.inputSize = p.segment.inputSize;
+    const uint64_t groups = uint64_t{p.inputSize} / 32;
+    p.plane0Stride = uint64_t{p.outputSize} * groups * p.segment.p0;
+    p.plane1Stride = uint64_t{p.outputSize} * groups * p.segment.p1;
+    p.metaStride = uint64_t{p.outputSize} * (groups / p.segment.metaGroups) * p.segment.metaBytes;
+    return p;
 }
 
 ops::Q4Projection readGgufProjection(WeightFile &file, std::string_view label) {

@@ -5,6 +5,7 @@
 // Metadata: [tile][unit][256 cols][MetaBytes], unit = super-block (256 K) or group32 (IQ4_NL, Q8_0).
 // Activations fp16 or bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output.
 #include "metal/abi/Gguf.h"
+#include "metal/abi/MoE.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -72,6 +73,7 @@ struct P20 { uint4 a; uint b; };
 struct P24 { uint4 a; uint2 b; };
 struct P12 { uint2 a; uint b; };
 struct P32 { uint4 a; uint4 b; };
+struct P64 { uint4 a; uint4 b; uint4 c; uint4 d; };
 
 struct FmtQ4K {
   enum : uint { P0 = 16, P1 = 0, MetaBytes = 16 }; enum : ushort { MetaGroups = 8, TgLut = 0 };
@@ -231,6 +233,16 @@ struct FmtIQ3S {
       v2 = select(v2, -v2, bool4(s & 16, s & 32, s & 64, s & 128));
       *((threadgroup half4 *)(dst + 8 * l)) = v1; *((threadgroup half4 *)(dst + 8 * l + 4)) = v2;
     }
+  }
+};
+// F16 plane: 32 fp16 weights per group (64 B) copied straight into the stage; the 2-byte meta per group is zero.
+struct FmtF16 {
+  enum : uint { P0 = 64, P1 = 0, MetaBytes = 2 }; enum : ushort { MetaGroups = 1, TgLut = 0 };
+  typedef P64 Payload; typedef ushort Meta;
+  static Payload load(device uchar *p0, device uchar *) { device uint4 *q = (device uint4 *)p0; return {q[0], q[1], q[2], q[3]}; }
+  static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
+  static void dequant32(Payload w, Meta, ushort, threadgroup half2 *, threadgroup half *dst) {
+    threadgroup uint4 *d = (threadgroup uint4 *)dst; d[0] = w.a; d[1] = w.b; d[2] = w.c; d[3] = w.d;
   }
 };
 
@@ -517,6 +529,7 @@ inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device 
   case GGUF_FMT_Q6K: sg_accum<FmtQ6K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
   case GGUF_FMT_Q3K: sg_accum<FmtQ3K, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
   case GGUF_FMT_Q80: sg_accum<FmtQ80, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
+  case GGUF_FMT_F16: sg_accum<FmtF16, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
   default: sg_accum<FmtIQ3S, TA, Rows, Cols, KS, Buffers, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc); break;
   }
 }
@@ -625,6 +638,7 @@ inline void gguf_splitk_tile(device bfloat *input, device uchar *w0, device ucha
 #define GGUF_SPLITK_SET(F, f) GGUF_SPLITK_K(F, f, 8) GGUF_SPLITK_K(F, f, 16) GGUF_SPLITK_K(F, f, 24) GGUF_SPLITK_K(F, f, 32)
 GGUF_SPLITK_SET(FmtQ4K, q4k) GGUF_SPLITK_SET(FmtIQ4XS<3>, iq4xs) GGUF_SPLITK_SET(FmtIQ4NL<0>, iq4nl) GGUF_SPLITK_SET(FmtQ5K, q5k)
 GGUF_SPLITK_SET(FmtQ6K, q6k) GGUF_SPLITK_SET(FmtQ3K, q3k) GGUF_SPLITK_SET(FmtQ80, q80) GGUF_SPLITK_SET(FmtIQ3S, iq3s)
+GGUF_SPLITK_SET(FmtF16, f16)
 
 #define PROD_SET(F, f)                                                                                    \
   SG_K(F, f, bfloat, a, 8, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 16, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 24, 32, 2, 32, 2, 1) SG_K(F, f, bfloat, a, 32, 32, 2, 32, 2, 1) \
@@ -634,6 +648,7 @@ GGUF_SPLITK_SET(FmtQ6K, q6k) GGUF_SPLITK_SET(FmtQ3K, q3k) GGUF_SPLITK_SET(FmtQ80
 PROD_SET(FmtQ4K, q4k)
 PROD_SET(FmtIQ4XS<3>, iq4xs)
 PROD_SET(FmtIQ4NL<0>, iq4nl)
+PROD_SET(FmtF16, f16)
 PROD_SET(FmtQ5K, q5k)
 PROD_SET(FmtQ6K, q6k)
 PROD_SET(FmtQ3K, q3k)
@@ -641,6 +656,163 @@ PROD_SET(FmtQ80, q80)
 PROD_SET(FmtIQ3S, iq3s)
 
 // ---------------- token embedding gather from native block_q4_K rows (row = K/256 blocks of 144 B)
+// ---------------- MoE experts over grouped tiles (metal/abi/MoE.h): one expert per tile of R rows, 64 output columns per
+// threadgroup. Expert e's planes start at e * stride; the shared expert (id == experts) has its own planes and formats.
+// gate/up: output = silu(gate) * up (both rounded to bf16 first, as the dense fused kernel does); down: plain output.
+#define GGUF_MOE_GATEUP_K(R)                                                                                           \
+  kernel void gguf_moe_gateup_m##R(device bfloat *grouped_input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]], \
+                            device const uint *tile_count [[buffer(2)]], SEGBUF(3, gw0, gw1, gm), SEGBUF(6, uw0, uw1, um),     \
+                            SEGBUF(9, sgw0, sgw1, sgm), SEGBUF(12, suw0, suw1, sum), device bfloat *output [[buffer(15)]],     \
+                            constant GgufMoeParams &p [[buffer(16)]], uint2 group [[threadgroup_position_in_grid]], IDS) {    \
+    if (group.y >= *tile_count) return;                                                                              \
+    threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                              \
+    gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                               \
+    const uint expert = tiles[group.y].expert; const bool shared = expert == p.experts;                              \
+    device uchar *g0 = shared ? sgw0 : gw0 + ulong(expert) * p.stride_a[0];                                          \
+    device uchar *g1 = shared ? sgw1 : gw1 + ulong(expert) * p.stride_a[1];                                          \
+    device uchar *gmeta = shared ? sgm : gm + ulong(expert) * p.stride_a[2];                                         \
+    device uchar *u0 = shared ? suw0 : uw0 + ulong(expert) * p.stride_b[0];                                          \
+    device uchar *u1 = shared ? suw1 : uw1 + ulong(expert) * p.stride_b[1];                                          \
+    device uchar *umeta = shared ? sum : um + ulong(expert) * p.stride_b[2];                                         \
+    const uint gfmt = shared ? p.shared_fmt_a : p.fmt_a, ufmt = shared ? p.shared_fmt_b : p.fmt_b;                   \
+    device bfloat *input = grouped_input + ulong(group.y) * R * p.input_size;                                        \
+    device bfloat *out = output + ulong(group.y) * R * p.output_size;                                                \
+    const uint origin = group.x * 64 + simd_group * 32, steps = p.input_size / 32;                                   \
+    threadgroup half *my = stage + simd_group * (2 * 32 * 32);                                                       \
+    auto gate = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                            \
+    for (ushort i = 0; i < gate.get_capacity(); ++i) gate[i] = 0.0f;                                                 \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(gfmt, input, g0, g1, gmeta, p.input_size, origin, my, tl, simd_lane, 0, steps, gate); \
+    auto up = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                              \
+    for (ushort i = 0; i < up.get_capacity(); ++i) up[i] = 0.0f;                                                     \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(ufmt, input, u0, u1, umeta, p.input_size, origin, my, tl, simd_lane, 0, steps, up); \
+    for (ushort i = 0; i < gate.get_capacity(); ++i) {                                                               \
+      if (!gate.is_valid_element(i)) continue;                                                                       \
+      auto index = gate.get_multidimensional_index(i);                                                               \
+      const float g = float(bfloat(gate[i])), u = float(bfloat(up[i]));                                              \
+      out[ulong(index[1]) * p.output_size + origin + index[0]] = bfloat(silu_gate(g) * u);                            \
+    }                                                                                                                \
+  }
+#define GGUF_MOE_DOWN_K(R)                                                                                             \
+  kernel void gguf_moe_down_m##R(device bfloat *grouped_input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]], \
+                          device const uint *tile_count [[buffer(2)]], SEGBUF(3, w0, w1, meta), SEGBUF(6, sw0, sw1, sm),     \
+                          device bfloat *output [[buffer(9)]], constant GgufMoeParams &p [[buffer(10)]],                    \
+                          uint2 group [[threadgroup_position_in_grid]], IDS) {                                                \
+    if (group.y >= *tile_count) return;                                                                              \
+    threadgroup half stage[2 * 2 * 32 * 32]; threadgroup half2 tl[256];                                              \
+    gguf_init_lut(tl, simd_group * 32 + simd_lane, 64);                                                               \
+    const uint expert = tiles[group.y].expert; const bool shared = expert == p.experts;                              \
+    device uchar *d0 = shared ? sw0 : w0 + ulong(expert) * p.stride_a[0];                                            \
+    device uchar *d1 = shared ? sw1 : w1 + ulong(expert) * p.stride_a[1];                                            \
+    device uchar *dmeta = shared ? sm : meta + ulong(expert) * p.stride_a[2];                                        \
+    const uint fmt = shared ? p.shared_fmt_a : p.fmt_a;                                                              \
+    device bfloat *input = grouped_input + ulong(group.y) * R * p.input_size;                                        \
+    device bfloat *out = output + ulong(group.y) * R * p.output_size;                                                \
+    const uint origin = group.x * 64 + simd_group * 32, steps = p.input_size / 32;                                   \
+    threadgroup half *my = stage + simd_group * (2 * 32 * 32);                                                       \
+    auto acc = gguf_make_acc<bfloat, R, 32, 32>(input, p.input_size, my);                                             \
+    for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;                                                   \
+    gguf_accum_any<bfloat, R, 32, 32, 2, 1>(fmt, input, d0, d1, dmeta, p.input_size, origin, my, tl, simd_lane, 0, steps, acc); \
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {                                                                \
+      if (!acc.is_valid_element(i)) continue;                                                                        \
+      auto index = acc.get_multidimensional_index(i);                                                                \
+      out[ulong(index[1]) * p.output_size + origin + index[0]] = bfloat(acc[i]);                                     \
+    }                                                                                                                \
+  }
+GGUF_MOE_GATEUP_K(8) GGUF_MOE_GATEUP_K(32)
+GGUF_MOE_DOWN_K(8) GGUF_MOE_DOWN_K(32)
+
+// ---------------- MoE routing with the GGUF's bf16 router and f32 shared-expert gate (splash packages use Q8 for both).
+// Eight rows by 32 experts per threadgroup, one simdgroup: rows are staged per 64-wide K slice with zero padding past the
+// last live row, and the bf16 router rows [experts][hidden] are the B operand directly. Scores stay f32 so the top-k
+// selection is not decided by bf16 rounding (llama.cpp routes on f32 logits).
+kernel void moe_route_scores_bf16(device bfloat *input [[buffer(0)]], device bfloat *router [[buffer(1)]],
+                                  device float *scores [[buffer(2)]], constant MoeRouteParams &params [[buffer(3)]],
+                                  uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
+  constexpr uint Rows = 8, TileN = 32, StorageN = 256;
+  threadgroup uint4 staged_storage[Rows * 64 * 2 / 16];
+  const uint row_base = group.x * Rows;
+  if (row_base >= params.rows) return;
+  const uint live_rows = min(Rows, params.rows - row_base);
+  const uint expert_origin = group.y * TileN;
+  const uint K = params.input_size, quant_groups = K / 64;
+  threadgroup bfloat *staged = reinterpret_cast<threadgroup bfloat *>(staged_storage);
+  auto a = tensor(staged, dextents<int, 2>{64, int(Rows)}, array<int, 2>{1, 64});
+  constexpr auto descriptor = matmul2d_descriptor(Rows, TileN, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  auto a_slice = a.slice<64, Rows>(0, 0);
+  tensor<device bfloat, dextents<int, 2>, tensor_inline> first_b(router + ulong(expert_origin) * K, dextents<int, 2>{64, TileN}, array<int, 2>{1, int(K)});
+  auto first_b_slice = first_b.slice<64, TileN>(0, 0);
+  auto acc = operation.get_destination_cooperative_tensor<decltype(a_slice), decltype(first_b_slice), float>();
+  for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
+  const uint stage_row = simd_lane / 4, stage_column = (simd_lane % 4) * 16;
+  device const bfloat *stage_source = input + ulong(row_base + min(stage_row, live_rows - 1)) * K + stage_column;
+  threadgroup uint4 *stage_destination = reinterpret_cast<threadgroup uint4 *>(staged + stage_row * 64 + stage_column);
+  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (stage_row < live_rows) {
+      device const uint4 *source = reinterpret_cast<device const uint4 *>(stage_source + quant_group * 64);
+      stage_destination[0] = source[0]; stage_destination[1] = source[1];
+    } else { stage_destination[0] = uint4(0); stage_destination[1] = uint4(0); }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    tensor<device bfloat, dextents<int, 2>, tensor_inline> b(router + ulong(expert_origin) * K + quant_group * 64, dextents<int, 2>{64, TileN}, array<int, 2>{1, int(K)});
+    auto b_slice = b.slice<64, TileN>(0, 0);
+    operation.run(a_slice, b_slice, acc);
+  }
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) continue;
+    auto index = acc.get_multidimensional_index(i);
+    if (uint(index[1]) < live_rows) scores[ulong(row_base + index[1]) * StorageN + expert_origin + index[0]] = acc[i];
+  }
+}
+
+// Same selection as moe_route_select_q8 (metal/kernels/shared/moe.metal) over f32 scores; the shared expert's scalar gate
+// is an f32 vector.
+kernel void moe_route_select_f32(device const float *scores [[buffer(0)]], device bfloat *input [[buffer(1)]],
+                                 device const float *shared_gate [[buffer(2)]], device uint *selected [[buffer(3)]],
+                                 device bfloat *routing_weights [[buffer(4)]], constant MoeRouteParams &params [[buffer(5)]],
+                                 uint group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+                                 uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256, Simdgroups = StorageN / 32, ExpertsPerLane = StorageN / 32;
+  threadgroup float row_scores[StorageN];
+  threadgroup float ordered[StorageN];
+  threadgroup float scalar_partials[Simdgroups];
+  const uint row = group;
+  if (row >= params.rows) return;
+  row_scores[thread_index] = thread_index < params.experts ? scores[ulong(row) * StorageN + thread_index] : -numeric_limits<float>::infinity();
+  device bfloat *row_input = input + ulong(row) * params.input_size;
+  float scalar = 0.0f;
+  for (uint dimension = thread_index; dimension < params.input_size; dimension += StorageN)
+    scalar += float(row_input[dimension]) * shared_gate[dimension];
+  scalar = simd_sum(scalar);
+  if (simd_lane == 0) scalar_partials[simd_group] = scalar;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong row_routes = ulong(row) * (params.top_k + 1);
+  if (thread_index == 0) {
+    float total = 0.0f;
+    for (uint partial = 0; partial < Simdgroups; ++partial) total += scalar_partials[partial];
+    selected[row_routes + params.top_k] = params.experts;
+    routing_weights[row_routes + params.top_k] = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * total)));
+  }
+  if (simd_group != 0) return;
+  float lane_scores[ExpertsPerLane];
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot) lane_scores[slot] = row_scores[simd_lane + 32 * slot];
+  for (uint rank = 0; rank < params.top_k; ++rank) {
+    float best = -numeric_limits<float>::infinity(); uint best_slot = 0;
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot) { if (lane_scores[slot] > best) { best = lane_scores[slot]; best_slot = slot; } }
+    const float row_best = simd_max(best);
+    const uint candidate = best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+    const uint winner = simd_min(candidate);
+    if (candidate == winner) lane_scores[best_slot] = -numeric_limits<float>::infinity();
+    if (simd_lane == 0) { ordered[rank] = row_best; selected[row_routes + rank] = winner; }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
+    float denominator = 0.0f;
+    for (uint other = 0; other < params.top_k; ++other) denominator += fast::exp2((ordered[other] - ordered[0]) * 1.44269504089f);
+    routing_weights[row_routes + rank] = bfloat(fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) / denominator);
+  }
+}
+
 kernel void gguf_embed_q4k(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], device bfloat *output [[buffer(2)]],
                       constant GgufEmbedParams &p [[buffer(3)]], uint index [[thread_position_in_grid]]) {
   const uint elements = p.rows * p.hidden; if (index >= elements) return;
@@ -714,7 +886,7 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
   const uint G = p.input_size / 32;
   if (t >= p.rows * G) return;
   const uint n = t / G, g = t % G, r = gguf_repack_source_row(n, p);
-  const bool k256 = !(p.fmt == GGUF_FMT_IQ4NL || p.fmt == GGUF_FMT_Q80);
+  const bool k256 = !(p.fmt == GGUF_FMT_IQ4NL || p.fmt == GGUF_FMT_Q80 || p.fmt == GGUF_FMT_F16);
   const uint b = k256 ? g / 8 : g, j = k256 ? g % 8 : 0, mg = k256 ? 8 : 1;
   uint blockBytes, p0, p1, mb;
   switch (p.fmt) {
@@ -725,6 +897,7 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
     case GGUF_FMT_Q6K: blockBytes = 210; p0 = 16; p1 = 8; mb = 20; break;
     case GGUF_FMT_Q3K: blockBytes = 110; p0 = 8; p1 = 4; mb = 16; break;
     case GGUF_FMT_Q80: blockBytes = 34; p0 = 32; p1 = 0; mb = 2; break;
+    case GGUF_FMT_F16: blockBytes = p.src_type == 0 ? 128 : 64; p0 = 64; p1 = 0; mb = 2; break;
     default: blockBytes = 110; p0 = 16; p1 = 0; mb = 2; break;  // IQ3_S
   }
   device const uchar *blk = src + p.src_offset + ulong(r) * p.src_row_bytes + ulong(b) * blockBytes;
@@ -787,6 +960,14 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
     case GGUF_FMT_Q80: {
       for (uint i = 0; i < 32; ++i) out0[i] = blk[2 + i];
       meta[0] = blk[0]; meta[1] = blk[1];
+      break;
+    }
+    case GGUF_FMT_F16: {   // 32 floats / halves / bfloats -> 32 halves (F32 and BF16 round once to fp16)
+      device half *h = (device half *)out0;
+      if (p.src_type == 0) { device const float *f = (device const float *)blk; for (uint i = 0; i < 32; ++i) h[i] = half(f[i]); }
+      else if (p.src_type == 1) { for (uint i = 0; i < 64; ++i) out0[i] = blk[i]; }
+      else { device const ushort *bf = (device const ushort *)blk; for (uint i = 0; i < 32; ++i) h[i] = half(as_type<float>(uint(bf[i]) << 16)); }
+      meta[0] = 0; meta[1] = 0;
       break;
     }
     default: {  // IQ3_S: qs(8) | signs(4) | qh(1) | 4-bit scale (1) | 0 0

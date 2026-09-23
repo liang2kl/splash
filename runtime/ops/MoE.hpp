@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 
 namespace splash::ops {
 
@@ -29,6 +30,20 @@ struct MoeShape final {
   }
 };
 
+// GGUF experts (model/GgufImage.hpp): routed projections as repacked tensors with per-expert slab strides,
+// the shared expert's projections as one-expert slabs, bf16 router rows [experts][hidden] and the shared
+// expert's f32 scalar gate [hidden]. Present in MoeWeights instead of its Q8/Q4 projections.
+struct MoeGgufWeights final {
+  metal::MetalBuffer router;
+  metal::MetalBuffer sharedGate;
+  GgufExpertProjection expertGate;
+  GgufExpertProjection expertUp;
+  GgufExpertProjection expertDown;
+  GgufExpertProjection sharedExpertGate;
+  GgufExpertProjection sharedExpertUp;
+  GgufExpertProjection sharedExpertDown;
+};
+
 // All weights for one sparse MoE block. The model package owns the buffers;
 // this value only exposes semantic projections to the operator. The shared
 // expert is a one-expert slab.
@@ -41,6 +56,7 @@ struct MoeWeights final {
   ExpertQ4Projection sharedUp;
   ExpertQ4Projection sharedDown;
   Q8Projection sharedExpertGate;
+  std::optional<MoeGgufWeights> gguf;
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows

@@ -79,6 +79,9 @@ inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
                                                    std::string_view label);
 [[nodiscard]] ops::Q4Projection readGgufProjection(WeightFile &file,
                                                      std::string_view label);
+// Routed experts as one repacked tensor (rows = experts * N) with per-expert slab strides.
+[[nodiscard]] ops::GgufExpertProjection readGgufExpertProjection(WeightFile &file, uint32_t experts,
+                                                                 std::string_view label);
 // Native block_q4_K rows for the token table (gathered, never multiplied).
 [[nodiscard]] ops::Q4Projection readGgufEmbedding(WeightFile &file,
                                                     std::string_view label);

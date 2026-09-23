@@ -33,6 +33,18 @@ struct GgufSegment final {
   const char *format = "";
 };
 
+// GGUF experts: one repacked tensor per projection whose rows are experts * outputSize; expert e's
+// planes are the contiguous slab starting at e * stride (all experts share the tensor's format).
+struct GgufExpertProjection final {
+  GgufSegment segment;
+  uint32_t experts = 0;
+  uint32_t outputSize = 0;
+  uint32_t inputSize = 0;
+  uint64_t plane0Stride = 0;
+  uint64_t plane1Stride = 0;
+  uint64_t metaStride = 0;
+};
+
 struct Q4Projection final {
   metal::MetalBuffer weights;
   metal::MetalBuffer scales;

@@ -127,10 +127,11 @@ New architectures require engine support; ordinary HF weights need conversion.
 
 ### GGUF targets
 
-Qwen3.8-27B can be served straight from a llama.cpp GGUF (for example Unsloth's
-`Qwen3.8-27B-UD-Q4_K_M.gguf`). A `gguf` package (schema 3) ships only the shared `draft/`,
-`vision/` and `tokenizer/`; its manifest names the source repository and the files a model ID
-may select:
+Qwen3.8-27B and Qwen3.6-35B-A3B can be served straight from a llama.cpp GGUF (for example
+Unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf` or `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`). A `gguf` package
+(schema 3) ships only the shared `draft/`, `vision/` and `tokenizer/`; its `model` names the
+architecture the GGUF must hold, and its manifest names the source repository and the files a
+model ID may select:
 
 ```json
 "format": {"name": "gguf", "target_layer_magic": "MDGG0001", ...},
@@ -151,16 +152,29 @@ optional high-bit plane and superblock headers in 256-column tiles, small tensor
 the CPU) and fills it with the `gguf_repack` / `gguf_copy` kernels reading the mmapped file
 (`GgufTarget.cpp`). The images are anonymous Metal memory, so under memory pressure they are
 compressed or swapped rather than dropped and refaulted like mapped package files. Supported
-tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and Q4_K,
-Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one error. Of
-Unsloth's files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL, UD-Q8_K_L
-and Q8_0; the 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and BF16-bearing files need kernels that do not
-exist yet.
+tensor types are Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears, F32/F16/BF16
+linears (converted to fp16 planes, format `GGUF_FMT_F16`), and Q4_K, Q6_K or Q8_0 token
+embeddings; the loader lists every unsupported tensor in one error. Of Unsloth's Qwen3.8-27B
+files that covers UD-Q4_K_M/XL, UD-Q5_K_M/S/XL, UD-Q6_K and Q6_K_L/M/XL, UD-Q8_K_L and Q8_0; of
+the Qwen3.6-35B-A3B files Q8_0, UD-IQ4_NL, UD-IQ4_NL_XL, UD-IQ4_XS, UD-Q4_K_M/S/XL, UD-Q5_K_M/S/XL,
+UD-Q6_K, UD-Q6_K_XL and UD-Q8_K_XL. The 2-bit, IQ2/IQ3_XXS, IQ1, Q4_0/Q4_1 and MXFP4 files need
+kernels that do not exist yet.
+
+For the MoE model (`qwen35moe`) the per-layer image also holds the router (`ffn_gate_inp`, F32 in
+the GGUF, stored as bf16 rows), the shared expert's scalar gate (F32 vector), the routed experts as
+one slab per projection with all experts stacked at a fixed stride (`GgufExpertProjection`), and
+the shared expert as ordinary projections. Routing runs `moe_route_scores_bf16` and
+`moe_route_select_f32`; the expert passes run `gguf_moe_gateup_m{8,32}` / `gguf_moe_down_m{8,32}`
+over the same grouped tiles as the packed MoE path (`runtime/ops/MoE.cpp`), each tile dequantizing
+its expert's slab with the runtime format switch, the shared expert (id == experts) with its own
+formats. The GDN in-projection binds the F32 `ssm_alpha`/`ssm_beta` rows as fp16 planes through
+the same F16 format.
 
 The GEMM kernels are in
 `runtime/metal/kernels/shared/gguf_linear.metal` (ABI in `runtime/metal/abi/Gguf.h`), the dispatch
-policy in `runtime/ops/Linear.cpp`, and `make test-engine-metal` checks the kernels against fp64
-and, with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, against upstream GGML's dequantization.
+policy in `runtime/ops/Linear.cpp`, and `make test-engine-metal` checks the kernels (including the
+MoE expert tiles against the dense kernels and the routing kernels) against fp64 and, with
+`SPLASH_GGML_ORACLE=<libggml-base.dylib>`, against upstream GGML's dequantization.
 
 ## Code and API boundaries
 
