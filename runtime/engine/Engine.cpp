@@ -15,7 +15,8 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
-    : config_(config), cache_(cache), model_(model), events_(events) {
+    : config_(config), cache_(cache), model_(model), events_(events),
+      scheduler_(config.prefillBlockRows) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -29,6 +30,9 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument(
         "prefill checkpoint interval must span a draft window and whole KV pages");
   }
+  if (config_.prefillBlockRows != model::ExecutionLimits::prefillTokenBudget &&
+      config_.prefillBlockRows != model::ExecutionLimits::prefillBlockRows)
+    throw std::invalid_argument("prefill block rows must be the token budget or the block limit");
 }
 
 void Engine::submit(EngineRequest value) {

@@ -5,19 +5,19 @@
 namespace splash::model {
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
-                   const ops::ExecutionPlans &operators) {
+                   const ops::ExecutionPlans &operators, uint32_t blockRows) {
   std::array<uint64_t, prefillTensorCount> result{};
   auto put = [&](PrefillTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
   };
   put(PrefillTensor::Hidden0,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{blockRows} * geometry.target.hiddenSize));
   put(PrefillTensor::Hidden1,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
-  put(PrefillTensor::InputTokens, bytesFor<uint32_t>(kPrefillRows));
+      bytesFor<uint16_t>(uint64_t{blockRows} * geometry.target.hiddenSize));
+  put(PrefillTensor::InputTokens, bytesFor<uint32_t>(blockRows));
   put(PrefillTensor::Normalized,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{blockRows} * geometry.target.hiddenSize));
   put(PrefillTensor::Captured,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.capturedHiddenSize()));
@@ -46,7 +46,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
   put(PrefillTensor::GdnOutput,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{blockRows} * geometry.target.hiddenSize));
   put(PrefillTensor::GateIntermediate,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.denseIntermediateSize));
@@ -74,25 +74,25 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
   put(PrefillTensor::AttentionOutput,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{blockRows} * geometry.target.hiddenSize));
   put(PrefillTensor::ProjectionSums,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{blockRows} *
                       geometry.projectionSumsWidth()));
   put(PrefillTensor::DownProjectionSums,
       bytesFor<float>(uint64_t{kPrefillRows} *
                       geometry.projectionSumsWidth()));
   // Three rotary axes per row (Qwen3.5 M-RoPE); text rows repeat one value.
   put(PrefillTensor::TargetPositions,
-      bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
+      bytesFor<uint32_t>(uint64_t{blockRows} * 3));
   put(PrefillTensor::DraftPositions, bytesFor<uint32_t>(kPrefillRows));
   put(PrefillTensor::TargetInverseFrequencies,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,
       bytesFor<float>(geometry.draftState.headDimension / 2));
   put(PrefillTensor::RopeCos,
-      bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
+      bytesFor<float>(uint64_t{blockRows} * geometry.target.rotaryPairs));
   put(PrefillTensor::RopeSin,
-      bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
+      bytesFor<float>(uint64_t{blockRows} * geometry.target.rotaryPairs));
   put(PrefillTensor::ContextProjected,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
@@ -132,9 +132,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
 }
 
 uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
-                            const ops::ExecutionPlans &operators) {
+                            const ops::ExecutionPlans &operators,
+                            uint32_t blockRows) {
   uint64_t bytes = 0;
-  for (uint64_t value : prefillTensorBytes(geometry, operators)) {
+  for (uint64_t value : prefillTensorBytes(geometry, operators, blockRows)) {
     bytes = checkedAdd(bytes, alignArena(value), "prefill arena");
   }
   return bytes;

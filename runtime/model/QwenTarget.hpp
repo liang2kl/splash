@@ -175,6 +175,9 @@ struct QwenTargetPrefillCapture final {
   uint32_t rows = 0;
 };
 
+// Rows of one request a prefill command's mixers attend in one chunk: a
+// request's rows past ExecutionLimits::prefillTokenBudget continue in the
+// next sequence, which starts where it ends and takes its GDN state.
 struct QwenTargetPrefillSequence final {
   uint32_t rowBegin = 0;
   uint32_t rows = 0;
@@ -299,9 +302,11 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows. The
-  // dense FFN of a chunk of at least AneFfn::kMinimumRows rows runs split
-  // with the Neural Engine on `aneFfn`, when given.
+  // Returns the hidden buffer that holds the last layer's output rows. Each
+  // layer's mixer runs over chunks of consecutive sequences of at most
+  // prefillTokenBudget rows, its FFN over all rows at once. The dense FFN of
+  // at least AneFfn::kMinimumRows rows runs split with the Neural Engine on
+  // `aneFfn`, when given; only it takes more than prefillTokenBudget rows.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
@@ -333,6 +338,9 @@ private:
                       ops::WeightLayout consumer) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
+  template <class Mixer>
+  metal::MetalBuffer addPrefillMixers(PrefillStep &step, const Mixer &mixer, const ops::NormWeights &norm,
+                                      metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
                                      metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,

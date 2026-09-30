@@ -23,6 +23,9 @@ struct EngineConfig final {
   // Zero disables progress checkpoints without changing reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
+  // Rows a lone, uncontended prefill command may take: the token budget, or
+  // ExecutionLimits::prefillBlockRows for a model that runs such blocks.
+  uint32_t prefillBlockRows = model::ExecutionLimits::prefillTokenBudget;
   // Patches per image the model's vision scratch covers; zero rejects images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;

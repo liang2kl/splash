@@ -182,6 +182,12 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &package) {
   return layers;
 }
 
+// The rows of one prefill command: blocks of several chunks run with the
+// Neural Engine's FFN split only.
+uint32_t prefillCommandRows(double aneFfnShare) noexcept {
+  return aneFfnShare > 0.0 ? ExecutionLimits::prefillBlockRows : kPrefillRows;
+}
+
 } // namespace
 
 struct Runtime::Impl {
@@ -291,6 +297,7 @@ struct Runtime::Impl {
   QwenTarget targetModel;
   DFlashDraft draftModel;
   std::unique_ptr<ops::AneFfn> aneFfn;
+  uint32_t prefillRows = kPrefillRows;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         admitAllocation(std::move(value.admitAllocation)),
@@ -319,11 +326,14 @@ struct Runtime::Impl {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded package");
     }
-    prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
+    prefillRows = prefillCommandRows(value.aneFfnShare);
+    prefillArena =
+        std::make_unique<PrefillArena>(backend, geometry, operators, prefillRows);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     if (value.aneFfnShare > 0.0)
-      aneFfn = std::make_unique<ops::AneFfn>(
-          backend, operators.linear(), aneFfnLayers(package), value.aneFfnShare);
+      aneFfn = std::make_unique<ops::AneFfn>(backend, operators.linear(),
+                                             aneFfnLayers(package),
+                                             value.aneFfnShare, prefillRows);
   }
 
   Request &request(uint64_t id) {
@@ -663,7 +673,7 @@ struct Runtime::Impl {
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
         prefillArena->get(PrefillTensor::DraftInverseFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
-        std::move(draftSin), {targetRows, draftRows}, kPrefillRows);
+        std::move(draftSin), {targetRows, draftRows}, prefillRows);
   }
 
   void captureFinalHidden(Request &entry, const MetalBuffer &rows,
@@ -825,16 +835,24 @@ struct Runtime::Impl {
         logicalPosition, chunkTokens, chunkStride, pages, kvPages.pageCount());
   }
 
+  // A sequence's rows attend in chunks of at most kPrefillRows rows. Only a
+  // block's lone sequence has more than one, and each of its chunks starts
+  // the attention scratch anew.
+  struct PackedPrefillChunk final {
+    uint32_t rows = 0;
+    uint32_t attentionStride = 0;
+    uint64_t queryOffset = 0;
+    uint64_t kvOffset = 0;
+    Q8ChunkedPrefillParams q8;
+  };
+
   struct PackedPrefillSequence final {
     Request *entry = nullptr;
     const ModelBatchItem *item = nullptr;
     uint32_t lane = 0;
     uint32_t rowBegin = 0;
-    uint32_t attentionStride = 0;
-    uint64_t queryOffset = 0;
-    uint64_t kvOffset = 0;
+    std::vector<PackedPrefillChunk> chunks;
     uint32_t captureBegin = 0;
-    Q8ChunkedPrefillParams q8;
     MetalBuffer pageTable;
     DispatchDraftCapturePlan captures;
   };
@@ -858,10 +876,12 @@ struct Runtime::Impl {
     batch.sequences.reserve(items.size());
     uint64_t queryOffset = 0;
     uint64_t kvOffset = 0;
+    // A lone request may take a block of prefillRows rows.
+    const uint32_t limit = items.size() == 1 ? prefillRows : kPrefillRows;
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = request(item.requestId);
-      if (item.tokenCount > kPrefillRows ||
+      if (item.tokenCount > limit ||
           item.promptOffset > entry.promptTokens ||
           item.tokenCount > entry.promptTokens - item.promptOffset ||
           item.logicalPosition != item.promptOffset || !entry.resident ||
@@ -873,7 +893,7 @@ struct Runtime::Impl {
           metadata.lengths.targetTokens != item.logicalPosition) {
         throw std::logic_error("packed prefill state length is not exact");
       }
-      if (item.tokenCount > kPrefillRows - batch.rows) {
+      if (item.tokenCount > limit - batch.rows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }
       auto captures = activeDraftCaptures(entry, item);
@@ -881,16 +901,23 @@ struct Runtime::Impl {
       if (capturedRows > kPrefillRows - batch.capturedRows) {
         throw std::invalid_argument("packed draft capture exceeds row budget");
       }
-      const uint32_t attentionStride =
-          ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
-      const Q8ChunkedPrefillParams q8 =
-          q8Params(item.logicalPosition, item.tokenCount, attentionStride,
-                   item.pageTable);
+      const bool block = item.tokenCount > kPrefillRows;
+      std::vector<PackedPrefillChunk> chunks;
+      for (uint32_t offset = 0; offset < item.tokenCount;
+           offset += kPrefillRows) {
+        const uint32_t rows = std::min(kPrefillRows, item.tokenCount - offset);
+        const uint32_t attentionStride =
+            ((rows + kTileRows - 1) / kTileRows) * kTileRows;
+        chunks.push_back({rows, attentionStride, block ? 0 : queryOffset,
+                          block ? 0 : kvOffset,
+                          q8Params(item.logicalPosition + offset, rows,
+                                   attentionStride, item.pageTable)});
+      }
+      const uint32_t attentionStride = chunks.front().attentionStride;
       MetalBuffer pageTable = synchronizedPageTable(entry, item);
       batch.sequences.push_back({&entry, &item, lane, batch.rows,
-                                 attentionStride, queryOffset, kvOffset,
-                                 batch.capturedRows, q8, std::move(pageTable),
-                                 std::move(captures)});
+                                 std::move(chunks), batch.capturedRows,
+                                 std::move(pageTable), std::move(captures)});
       entries[lane] = &entry;
       batch.rows += item.tokenCount;
       batch.capturedRows += capturedRows;
@@ -987,56 +1014,64 @@ struct Runtime::Impl {
       addImageRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
     }
 
-    std::array<QwenTargetPrefillSequence, kLaneCount> modelSequences{};
-    const uint32_t modelSequenceCount =
-        static_cast<uint32_t>(batch.sequences.size());
-    const uint64_t stateBindingCount = uint64_t{modelSequenceCount} *
-                                       geometry.target.stateLayout.layers;
+    // One model sequence per chunk. A block's chunks pass the GDN state
+    // between the slot's two parities, starting from the active one.
+    uint32_t modelSequenceCount = 0;
+    for (const PackedPrefillSequence &sequence : batch.sequences)
+      modelSequenceCount += static_cast<uint32_t>(sequence.chunks.size());
+    std::vector<QwenTargetPrefillSequence> modelSequences(modelSequenceCount);
+    const uint32_t gdnLayers = geometry.target.stateLayout.layers;
+    const uint64_t stateBindingCount = uint64_t{modelSequenceCount} * gdnLayers;
     std::vector<MetalBuffer> convolutionIn(stateBindingCount);
     std::vector<MetalBuffer> convolutionOut(stateBindingCount);
     std::vector<MetalBuffer> recurrentIn(stateBindingCount);
     std::vector<MetalBuffer> recurrentOut(stateBindingCount);
-    for (uint32_t lane = 0; lane < batch.sequences.size(); ++lane) {
-      const PackedPrefillSequence &sequence = batch.sequences[lane];
-      QwenTargetPrefillSequence &destination = modelSequences[lane];
-      destination.rowBegin = sequence.rowBegin;
-      destination.rows = sequence.item->tokenCount;
-      destination.attentionStride = sequence.attentionStride;
-      destination.queryOffset = sequence.queryOffset;
-      destination.kvOffset = sequence.kvOffset;
-      destination.q8 = sequence.q8;
-      destination.pageTable = sequence.pageTable;
-      const uint32_t gdnLayers = geometry.target.stateLayout.layers;
-      const uint64_t stateBegin = uint64_t{lane} * gdnLayers;
-      destination.convolutionIn =
-          std::span(convolutionIn).subspan(stateBegin, gdnLayers);
-      destination.convolutionOut =
-          std::span(convolutionOut).subspan(stateBegin, gdnLayers);
-      destination.recurrentIn =
-          std::span(recurrentIn).subspan(stateBegin, gdnLayers);
-      destination.recurrentOut =
-          std::span(recurrentOut).subspan(stateBegin, gdnLayers);
+    uint32_t modelSequence = 0;
+    for (const PackedPrefillSequence &sequence : batch.sequences) {
       const QwenSlotMetadata &metadata = states.metadata(sequence.entry->slot);
       const QwenSlotBuffers &slot = states.buffers(sequence.entry->slot);
-      for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
-        convolutionIn[stateBegin + layer] =
-            slot.gdn[metadata.activeParity].convolutionLayers[layer];
-        convolutionOut[stateBegin + layer] =
-            slot.gdn[metadata.activeParity ^ 1].convolutionLayers[layer];
-        recurrentIn[stateBegin + layer] =
-            slot.gdn[metadata.activeParity].recurrentLayers[layer];
-        recurrentOut[stateBegin + layer] =
-            slot.gdn[metadata.activeParity ^ 1].recurrentLayers[layer];
-      }
-      destination.captureCount = sequence.captures.size();
-      for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
-        const DispatchDraftCaptureSpan &capture = sequence.captures[index];
-        destination.captures[index] = {
-            sequence.rowBegin +
-                static_cast<uint32_t>(capture.absoluteBegin -
-                                      sequence.item->logicalPosition),
-            sequence.captureBegin + capture.compactDestinationRow,
-            capture.absoluteEnd - capture.absoluteBegin};
+      for (uint32_t chunk = 0; chunk < sequence.chunks.size(); ++chunk) {
+        const PackedPrefillChunk &part = sequence.chunks[chunk];
+        QwenTargetPrefillSequence &destination = modelSequences[modelSequence];
+        destination.rowBegin = sequence.rowBegin + chunk * kPrefillRows;
+        destination.rows = part.rows;
+        destination.attentionStride = part.attentionStride;
+        destination.queryOffset = part.queryOffset;
+        destination.kvOffset = part.kvOffset;
+        destination.q8 = part.q8;
+        destination.pageTable = sequence.pageTable;
+        const uint64_t stateBegin = uint64_t{modelSequence++} * gdnLayers;
+        destination.convolutionIn =
+            std::span(convolutionIn).subspan(stateBegin, gdnLayers);
+        destination.convolutionOut =
+            std::span(convolutionOut).subspan(stateBegin, gdnLayers);
+        destination.recurrentIn =
+            std::span(recurrentIn).subspan(stateBegin, gdnLayers);
+        destination.recurrentOut =
+            std::span(recurrentOut).subspan(stateBegin, gdnLayers);
+        const uint32_t parity = metadata.activeParity ^ (chunk & 1);
+        for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
+          convolutionIn[stateBegin + layer] =
+              slot.gdn[parity].convolutionLayers[layer];
+          convolutionOut[stateBegin + layer] =
+              slot.gdn[parity ^ 1].convolutionLayers[layer];
+          recurrentIn[stateBegin + layer] =
+              slot.gdn[parity].recurrentLayers[layer];
+          recurrentOut[stateBegin + layer] =
+              slot.gdn[parity ^ 1].recurrentLayers[layer];
+        }
+        if (chunk)
+          continue;
+        destination.captureCount = sequence.captures.size();
+        for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
+          const DispatchDraftCaptureSpan &capture = sequence.captures[index];
+          destination.captures[index] = {
+              sequence.rowBegin +
+                  static_cast<uint32_t>(capture.absoluteBegin -
+                                        sequence.item->logicalPosition),
+              sequence.captureBegin + capture.compactDestinationRow,
+              capture.absoluteEnd - capture.absoluteBegin};
+        }
       }
     }
     QwenTargetPrefillBuffers buffers;
@@ -1077,9 +1112,8 @@ struct Runtime::Impl {
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
       kvLayers[layer] = kvPages.layer(layer);
     const MetalBuffer finalHidden = targetModel.addPrefill(
-        graph, std::move(buffers),
-        std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvLayers, aneFfn.get());
+        graph, std::move(buffers), modelSequences, batch.rows, kvLayers,
+        aneFfn.get());
     addPackedDraftContext(graph, batch);
 
     for (const PackedPrefillSequence &sequence : batch.sequences) {
@@ -2118,7 +2152,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
         entry.draftContextValid = true;
         entry.draftContextThrough = capture.absoluteEnd;
       }
-      impl->states.swapParity(entry.slot);
+      // A block's even count of chunks leaves the state in the active parity.
+      if ((item.tokenCount + kPrefillRows - 1) / kPrefillRows & 1)
+        impl->states.swapParity(entry.slot);
       uint64_t nextLength = item.logicalPosition + item.tokenCount;
       QwenLogicalLengths lengths = impl->states.metadata(entry.slot).lengths;
       lengths.targetTokens = nextLength;
@@ -2823,9 +2859,10 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
     throw std::invalid_argument("model runtime requires Apple tensor BF16");
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
-  uint64_t prefillBytes = plannedPrefillBytes(geometry, operators);
+  const uint32_t prefillRows = prefillCommandRows(aneFfnShare);
+  uint64_t prefillBytes = plannedPrefillBytes(geometry, operators, prefillRows);
   if (aneFfnShare > 0.0) {
-    prefillBytes += ops::AneFfn::plannedBytes(aneFfnLayers(package), aneFfnShare);
+    prefillBytes += ops::AneFfn::plannedBytes(aneFfnLayers(package), aneFfnShare, prefillRows);
   }
   return {package.stateLayout().activeCellBytes(), prefillBytes,
           plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,

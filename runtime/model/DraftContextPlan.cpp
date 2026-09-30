@@ -109,7 +109,7 @@ draftCaptureSpansForDispatch(const DraftContextPlan &plan,
   if (dispatchEnd < dispatchBegin || dispatchBegin < plan.replayBegin ||
       dispatchEnd > plan.replayEnd ||
       dispatchEnd - dispatchBegin >
-          model::ExecutionLimits::prefillTokenBudget) {
+          model::ExecutionLimits::prefillBlockRows) {
     throw std::invalid_argument("invalid target-prefill dispatch range");
   }
 

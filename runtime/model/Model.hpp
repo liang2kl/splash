@@ -281,6 +281,10 @@ struct ModelCapabilities final {
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
+  // The most rows of one request a prefill command takes when a dense
+  // target's FFN runs split with the Neural Engine (ops/AneFfn.hpp): its
+  // mixers run in chunks of prefillTokenBudget rows, its FFN over them all.
+  static constexpr uint32_t prefillBlockRows = 4 * prefillTokenBudget;
   static constexpr uint32_t draftQueryRows = 8;
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
