@@ -260,6 +260,11 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.aneFfnShare = arguments.aneFfnShare;
+  if (arguments.aneFfnShare > 0.0) {
+    // Blocks end at checkpoints, which then fall one block apart.
+    config.nativeLoop.engine.prefillBlockRows = model::ExecutionLimits::prefillBlockRows;
+    config.nativeLoop.engine.prefillCheckpointTokens = model::ExecutionLimits::prefillBlockRows;
+  }
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;

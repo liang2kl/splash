@@ -181,6 +181,14 @@ metal::MetalBuffer rowsOf(metal::MetalBackend &backend, const metal::MetalBuffer
   return backend.view(buffer, uint64_t{begin} * width * sizeof(T), uint64_t{count} * width * sizeof(T));
 }
 
+// The bf16 rows of a row-major buffer of `width` values from row `begin` on,
+// which include the padding rows of a chunk's tiles.
+metal::MetalBuffer rowsFrom(metal::MetalBackend &backend, const metal::MetalBuffer &buffer, uint32_t begin,
+                            uint32_t width) {
+  const uint64_t offset = uint64_t{begin} * width * sizeof(uint16_t);
+  return backend.view(buffer, offset, buffer.sizeBytes() - offset);
+}
+
 void requireLayerPartition(const QwenTargetGeometry &geometry, uint32_t gdnLayers, uint32_t attentionLayers) {
   if (gdnLayers != geometry.stateLayout.layers || attentionLayers != geometry.kvLayout.attentionLayers)
     throw std::logic_error("Qwen target layer partition mismatch");
@@ -189,7 +197,9 @@ void requireLayerPartition(const QwenTargetGeometry &geometry, uint32_t gdnLayer
 } // namespace
 
 // The state a prefill command's layers share: its inputs and the next GDN,
-// attention and dense FFN layer of the step.
+// attention and dense FFN layer of the step. A mixer chunk's step covers its
+// sequences' rows from rowBegin; its norm, projection sums and scratch rows
+// start at row 0.
 struct QwenTarget::PrefillStep {
   metal::CommandGraph &graph;
   const QwenTargetPrefillBuffers &buffers;
@@ -201,6 +211,7 @@ struct QwenTarget::PrefillStep {
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
   uint32_t ffnLayer = 0;
+  uint32_t rowBegin = 0;
 };
 
 struct QwenTarget::VerifyStep {
@@ -224,12 +235,15 @@ metal::MetalBuffer QwenTarget::addPrefill(
     std::span<const kv::LayerStorage> kvLayers, ops::AneFfn *aneFfn) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
-      rows > ExecutionLimits::prefillTokenBudget ||
+      rows > ExecutionLimits::prefillBlockRows ||
+      (rows > ExecutionLimits::prefillTokenBudget &&
+       (!aneFfn || geometry_.ffnKind != QwenFfnKind::Dense)) ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen packed prefill batch");
   }
   for (const QwenTargetPrefillSequence &sequence : sequences) {
-    if (sequence.convolutionIn.size() != geometry_.stateLayout.layers ||
+    if (!sequence.rows || sequence.rows > ExecutionLimits::prefillTokenBudget ||
+        sequence.convolutionIn.size() != geometry_.stateLayout.layers ||
         sequence.convolutionOut.size() != geometry_.stateLayout.layers ||
         sequence.recurrentIn.size() != geometry_.stateLayout.layers ||
         sequence.recurrentOut.size() != geometry_.stateLayout.layers) {
@@ -245,7 +259,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
       const metal::MetalBuffer input = buffers.hidden[index & 1];
       const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
       const metal::MetalBuffer residual = std::visit(
-          [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
+          [&](const auto &mixer) { return addPrefillMixers(step, mixer, layer.inputNorm, input); }, layer.mixer);
       addPrefillFfn(step, layer, residual, output);
       if (const auto slot = geometry_.captureSlot(index))
         for (const QwenTargetPrefillSequence &sequence : sequences)
@@ -283,6 +297,28 @@ void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, 
                                          step.rows, b.linearScratch);
 }
 
+// The chunks of the step's sequences, each over its rows of `input`: the
+// returned output rows hold them all.
+template <class Mixer>
+metal::MetalBuffer QwenTarget::addPrefillMixers(PrefillStep &step, const Mixer &mixer, const ops::NormWeights &norm,
+                                                metal::MetalBuffer input) const {
+  metal::MetalBuffer output;
+  for (size_t first = 0, last = 0; first < step.sequences.size(); first = last) {
+    uint32_t rows = 0;
+    while (last < step.sequences.size() && rows + step.sequences[last].rows <= ExecutionLimits::prefillTokenBudget)
+      rows += step.sequences[last++].rows;
+    const uint32_t rowBegin = step.sequences[first].rowBegin;
+    PrefillStep chunk{step.graph, step.buffers, step.sequences.subspan(first, last - first), rows, step.kvLayers,
+                      step.moe, nullptr, step.gdnLayer, step.attentionLayer, step.ffnLayer, rowBegin};
+    output = addPrefillMixer(chunk, mixer, norm, rowsFrom(backend_, input, rowBegin, geometry_.hiddenSize));
+    if (last == step.sequences.size()) {
+      step.gdnLayer = chunk.gdnLayer;
+      step.attentionLayer = chunk.attentionLayer;
+    }
+  }
+  return output;
+}
+
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
@@ -292,10 +328,10 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
                                  step.rows, b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
-      return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
+      return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin - step.rowBegin, sequence.rows, width);
     };
     const auto f32 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
-      return rowsOf<float>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
+      return rowsOf<float>(backend_, buffer, sequence.rowBegin - step.rowBegin, sequence.rows, width);
     };
     ops::GDN::addPrefill(
         step.graph,
@@ -307,7 +343,8 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
          mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
         geometry_.gdnShape(), sequence.rows, mixer.outputHeadOrder);
   }
-  addPrefillOutput(step, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput);
+  addPrefillOutput(step, b.gdnHidden, mixer.outputProjection, input,
+                   rowsFrom(backend_, b.gdnOutput, step.rowBegin, geometry_.hiddenSize));
   return b.gdnOutput;
 }
 
@@ -320,8 +357,9 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
                                  step.rows, b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
-      return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
+      return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin - step.rowBegin, sequence.rows, width);
     };
+    // The RoPE tables cover all of the command's rows.
     const auto f32 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<float>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
     };
@@ -349,7 +387,8 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
         u16(b.attentionHidden, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
         sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
   }
-  addPrefillOutput(step, b.attentionHidden, mixer.outputProjection, input, b.attentionOutput);
+  addPrefillOutput(step, b.attentionHidden, mixer.outputProjection, input,
+                   rowsFrom(backend_, b.attentionOutput, step.rowBegin, geometry_.hiddenSize));
   return b.attentionOutput;
 }
 

@@ -156,18 +156,24 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 
 // Sizes depend on the geometry and the installed operator choices; the arena
 // bounds include the operator defaults and every installed configuration.
+// The rows a command's layers pass between their mixer chunks and FFN, with
+// their tokens and positions, take `blockRows` rows (ExecutionLimits::
+// prefillBlockRows); every other tensor serves one chunk of kPrefillRows.
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
-                   const ops::ExecutionPlans &operators);
+                   const ops::ExecutionPlans &operators,
+                   uint32_t blockRows = kPrefillRows);
 [[nodiscard]] uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
-                                           const ops::ExecutionPlans &operators);
+                                           const ops::ExecutionPlans &operators,
+                                           uint32_t blockRows = kPrefillRows);
 
 class PrefillArena final {
 public:
   PrefillArena(metal::MetalBackend &backend, const RuntimeGeometry &geometry,
-                const ops::ExecutionPlans &operators)
-      : bytes_(plannedPrefillBytes(geometry, operators)) {
-    const auto sizes = prefillTensorBytes(geometry, operators);
+                const ops::ExecutionPlans &operators,
+                uint32_t blockRows = kPrefillRows)
+      : bytes_(plannedPrefillBytes(geometry, operators, blockRows)) {
+    const auto sizes = prefillTensorBytes(geometry, operators, blockRows);
     base_ = backend.allocateBuffer(bytes_, metal::BufferStorage::Shared,
                                    "qwen-shared-prefill");
     uint64_t cursor = 0;

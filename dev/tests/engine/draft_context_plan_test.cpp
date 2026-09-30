@@ -276,8 +276,8 @@ void testInvalidInputs() {
 
   threw = false;
   try {
-    const auto plan = activePlan(0, 4096);
-    (void)draftCaptureSpansForDispatch(plan, 0, 2049);
+    const auto plan = activePlan(0, 16384);
+    (void)draftCaptureSpansForDispatch(plan, 0, 8193);
   } catch (const std::invalid_argument &) {
     threw = true;
   }

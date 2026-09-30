@@ -62,6 +62,12 @@ struct SchedulerSnapshot final {
 // M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
+  // A lone prefill request no peer waits on takes up to prefillBlockRows
+  // rows per command, others at most the model's token budget; a command of
+  // more than the budget takes more than prefillBlockRows less the budget.
+  explicit Scheduler(uint32_t prefillBlockRows = model::ExecutionLimits::prefillTokenBudget)
+      : prefillBlockRows_(prefillBlockRows) {}
+
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
   void deferAdmission(uint64_t requestId);
@@ -136,6 +142,7 @@ private:
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
+  uint32_t prefillBlockRows_;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };
