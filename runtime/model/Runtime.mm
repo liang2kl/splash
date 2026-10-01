@@ -333,7 +333,7 @@ struct Runtime::Impl {
     if (value.aneFfnShare > 0.0)
       aneFfn = std::make_unique<ops::AneFfn>(backend, operators.linear(),
                                              aneFfnLayers(package),
-                                             value.aneFfnShare, prefillRows);
+                                             value.aneFfnShare, prefillRows / ops::AneFfn::kChunkRows);
   }
 
   Request &request(uint64_t id) {
@@ -2104,14 +2104,13 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  if (impl_->aneFfn)
-    impl_->aneFfn->submit();
+  const uint64_t aneCommand = impl_->aneFfn ? impl_->aneFfn->submit() : 0;
   CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
   Impl *impl = impl_.get();
-  auto finish = [impl, entries,
+  auto finish = [impl, entries, aneCommand,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     if (impl->aneFfn)
-      impl->aneFfn->finish();
+      impl->aneFfn->finish(aneCommand);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       for (Impl::ImageState &image : entries[lane]->images) {
         if (!image.data || !image.data->encoding)
@@ -2862,7 +2861,7 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
   const uint32_t prefillRows = prefillCommandRows(aneFfnShare);
   uint64_t prefillBytes = plannedPrefillBytes(geometry, operators, prefillRows);
   if (aneFfnShare > 0.0) {
-    prefillBytes += ops::AneFfn::plannedBytes(aneFfnLayers(package), aneFfnShare, prefillRows);
+    prefillBytes += ops::AneFfn::plannedBytes(aneFfnLayers(package), aneFfnShare, prefillRows / ops::AneFfn::kChunkRows);
   }
   return {package.stateLayout().activeCellBytes(), prefillBytes,
           plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,

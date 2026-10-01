@@ -28,6 +28,7 @@ constexpr uint32_t kIntermediateBlock = 512;
 constexpr uint32_t kSegment = 2560;
 constexpr uint32_t kQuantGroup = 64;
 constexpr auto kCompletionTimeout = std::chrono::seconds(10);
+constexpr size_t kQueueWindow = 32;
 
 // Whole blocks of the intermediate rotation for the ANE, whole 256-row tiles
 // of the Q4 planes for the GPU.
@@ -254,24 +255,16 @@ std::string ffnProgram(uint32_t hidden, uint32_t channels, const std::vector<uin
   return "program(1.3)\n{\n    func main_ane<ios18>(" + parameters + ") {\n" + body + "    } -> (y);\n}\n";
 }
 
-// The rows of the ANE programs of commands of up to `maximumRows` rows.
-std::vector<uint32_t> programRows(uint32_t maximumRows) {
-  if (!maximumRows || maximumRows % AneFfn::kChunkRows)
-    throw std::invalid_argument("ANE FFN rows must be whole prefill chunks");
-  if (maximumRows == AneFfn::kChunkRows) return {maximumRows};
-  return {AneFfn::kChunkRows, maximumRows};
-}
-
 } // namespace
 
-uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double share, uint32_t maximumRows) {
+uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double share, uint32_t chunks) {
   const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
   const uint32_t gpu = gpuChannels(intermediate, share), ane = intermediate - gpu;
   uint64_t bytes = pages(kIntermediateBlock * sizeof(float)) + pages(uint64_t{layers.size()} * (2 * ane + hidden) * 2) +
-                   pages(uint64_t{maximumRows} * hidden * 2);
-  for (uint32_t rows : programRows(maximumRows))
-    bytes += (hidden / kSegment) * ane::Surface::bytes(kSegment, rows, Element::Int8) +
-             ane::Surface::bytes(1, rows, Element::Float16) + ane::Surface::bytes(hidden, rows, Element::Float16);
+                   pages(uint64_t{kChunkRows} * hidden * 2) +
+                   chunks * ((hidden / kSegment) * ane::Surface::bytes(kSegment, kChunkRows, Element::Int8) +
+                             ane::Surface::bytes(1, kChunkRows, Element::Float16) +
+                             ane::Surface::bytes(hidden, kChunkRows, Element::Float16));
   uint64_t set = 2 * ane::Surface::bytes(ane, 1, Element::Float16) + ane::Surface::bytes(hidden, 1, Element::Float16) +
                  2 * (hidden / kSegment) * ane::Surface::bytes(ane, kSegment, Element::Int8);
   for (uint32_t width : segments(ane)) set += ane::Surface::bytes(hidden, width, Element::Int8);
@@ -280,7 +273,7 @@ uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double 
 }
 
 AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-               double share, uint32_t maximumRows)
+               double share, uint32_t chunks)
     : backend_(backend), linear_(linear) {
   if (layers.empty()) throw std::invalid_argument("ANE FFN split has no layers");
   hidden_ = layers.front().gate->inputSize;
@@ -313,7 +306,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   signs_ = allocate(sizeof signs, "ane ffn signs");
   std::memcpy(signs_.contents(), signs.data(), sizeof signs);
   rowScales_ = allocate(uint64_t{layers.size()} * (2 * aneChannels_ + hidden_) * 2, "ane ffn row scales");
-  rotated_ = allocate(uint64_t{maximumRows} * hidden_ * 2, "ane ffn rotated input");
+  if (!chunks) throw std::invalid_argument("ANE FFN split takes at least one chunk");
+  rotated_ = allocate(uint64_t{kChunkRows} * hidden_ * 2, "ane ffn rotated input");
 
   // The GPU's share: gate and up rows lead each projection's 256-row tiles;
   // down's leading inputs are copied out of each of its tiles.
@@ -355,32 +349,31 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   }
 
   const std::vector<uint8_t> blob = rotationBlob(aneChannels_, signs);
-  for (uint32_t rows : programRows(maximumRows)) {
-    Evaluation &evaluation = evaluations_.emplace_back();
-    evaluation.rows = rows;
+  program_ = std::make_unique<ane::Program>(ffnProgram(hidden_, aneChannels_, downSegments_, kChunkRows), blob);
+  for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+    Slot &slot = slots_.emplace_back();
     for (uint32_t k = 0; k < hidden_ / kSegment; ++k)
-      evaluation.inputs.push_back(surface(kSegment, rows, Element::Int8));
-    evaluation.tokenScale = surface(1, rows, Element::Float16);
-    evaluation.partial = surface(hidden_, rows, Element::Float16);
-    evaluation.program = std::make_unique<ane::Program>(ffnProgram(hidden_, aneChannels_, downSegments_, rows), blob);
+      slot.inputs.push_back(surface(kSegment, kChunkRows, Element::Int8));
+    slot.tokenScale = surface(1, kChunkRows, Element::Float16);
+    slot.partial = surface(hidden_, kChunkRows, Element::Float16);
     for (uint32_t index = 0; index < 2; ++index) {
       const Weights &set = sets_[index];
-      std::vector<ane::Surface> &bindings = evaluation.bindings[index];
-      for (const std::string &name : evaluation.program->inputs()) {
+      std::vector<ane::Surface> &bindings = slot.bindings[index];
+      for (const std::string &name : program_->inputs()) {
         const auto segment = [&](size_t prefix) { return std::stoul(name.substr(prefix)); };
-        if (name == "tx") bindings.push_back(evaluation.tokenScale);
+        if (name == "tx") bindings.push_back(slot.tokenScale);
         else if (name == "sg") bindings.push_back(set.gateScale);
         else if (name == "su") bindings.push_back(set.upScale);
         else if (name == "sd") bindings.push_back(set.downScale);
         else if (name.starts_with("wg")) bindings.push_back(set.gate.at(segment(2)));
         else if (name.starts_with("wu")) bindings.push_back(set.up.at(segment(2)));
         else if (name.starts_with("wd")) bindings.push_back(set.down.at(segment(2)));
-        else if (name.starts_with("x")) bindings.push_back(evaluation.inputs.at(segment(1)));
+        else if (name.starts_with("x")) bindings.push_back(slot.inputs.at(segment(1)));
         else throw std::logic_error("unknown ANE FFN program input " + name);
       }
     }
+    slot.event = backend_.newSharedEvent();
   }
-  event_ = backend_.newSharedEvent();
 
   // Each row's shared int8 scale over the ANE's share of its inputs.
   metal::CommandGraph graph;
@@ -400,7 +393,14 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   static_cast<void>(backend_.submitCommand(graph.dispatches()));
 }
 
-AneFfn::~AneFfn() { static_cast<void>(wait(true)); }
+// Every command has completed: nothing will signal evaluations still queued.
+AneFfn::~AneFfn() {
+  std::unique_lock lock(queue_->mutex);
+  for (const Job &job : queue_->running) ane::Program::release(slots_[job.slot].event, job.wait);
+  queue_->abandoned = true;
+  feed(lock);
+  static_cast<void>(wait(lock, queue_->submitted));
+}
 
 metal::MetalBuffer AneFfn::rowScales(uint32_t layer, uint32_t part) const {
   const uint64_t offset = (uint64_t{layer} * (2 * aneChannels_ + hidden_) + uint64_t{part} * aneChannels_) * 2;
@@ -435,82 +435,134 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
   }
 }
 
-void AneFfn::add(metal::CommandGraph &graph, uint32_t layer, metal::MetalBuffer normalized, metal::MetalBuffer sums,
-                 metal::MetalBuffer gateScratch, metal::MetalBuffer intermediate, metal::MetalBuffer downSums,
-                 metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, LinearScratch scratch) {
-  if (!rows || rows > evaluations_.back().rows) throw std::invalid_argument("ANE FFN command exceeds its rows");
+void AneFfn::begin() noexcept {
+  jobs_.clear();
+  for (Slot &slot : slots_) {
+    slot.pending = 0;
+    slot.output = {};
+  }
+}
+
+void AneFfn::add(metal::CommandGraph &graph, uint32_t layer, uint32_t chunk, uint32_t chunks,
+                 metal::MetalBuffer normalized, metal::MetalBuffer sums, metal::MetalBuffer gateScratch,
+                 metal::MetalBuffer intermediate, metal::MetalBuffer downSums, metal::MetalBuffer residual,
+                 metal::MetalBuffer output, uint32_t rows, LinearScratch scratch) {
+  if (!rows || rows > kChunkRows || chunk >= chunks || chunks > slots_.size())
+    throw std::invalid_argument("ANE FFN chunk exceeds the split's chunks or rows");
+  Slot &slot = slots_[chunk];
+  if (slot.pending) throw std::logic_error("ANE FFN chunk started before its last FFN was joined");
   const Layer &current = layers_.at(layer);
   const uint32_t set = layer & 1, tiles = (rows + 31) / 32;
-  const uint32_t index = rows <= evaluations_.front().rows ? 0 : static_cast<uint32_t>(evaluations_.size() - 1);
-  const Evaluation &evaluation = evaluations_[index];
-  // Each command stages layer 0's weights, then each layer the next one's.
-  if (!layer) addWeights(graph, 0, 0);
-  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, evaluation.tokenScale.buffer},
-            AneFfnRotateParams{hidden_}, {rows, 1, 1}, {256, 1, 1});
-  for (uint32_t k = 0; k < evaluation.inputs.size(); ++k)
-    graph.add("ane_ffn_pack", {rotated_, evaluation.inputs[k].buffer},
-              AneFfnPackParams{hidden_, k * kSegment, evaluation.inputs[k].strideBytes}, {tiles, kSegment / 32, 1},
+  // Each command stages layer 0's weights first.
+  if (!layer && !chunk) addWeights(graph, 0, 0);
+  graph.add("ane_ffn_rotate", {normalized, signs_, rotated_, slot.tokenScale.buffer}, AneFfnRotateParams{hidden_},
+            {rows, 1, 1}, {256, 1, 1});
+  for (uint32_t k = 0; k < slot.inputs.size(); ++k)
+    graph.add("ane_ffn_pack", {rotated_, slot.inputs[k].buffer},
+              AneFfnPackParams{hidden_, k * kSegment, slot.inputs[k].strideBytes}, {tiles, kSegment / 32, 1},
               {32, 8, 1});
-  const uint64_t wait = ++value_;
-  graph.signal(event_, wait);
-  for (uint32_t begin = 0; begin < rows; begin += kChunkRows) {
-    const uint32_t chunk = std::min(kChunkRows, rows - begin);
-    const auto from = [&](const metal::MetalBuffer &buffer, uint64_t rowBytes) {
-      return backend_.view(buffer, begin * rowBytes, buffer.sizeBytes() - begin * rowBytes);
-    };
-    const metal::MetalBuffer input = from(normalized, hidden_ * 2), inputSums = from(sums, hidden_ / kQuantGroup * 4);
-    linear_.addPrefill(graph, input, current.gate, gateScratch, inputSums, chunk, scratch);
-    linear_.addPrefillUpWithGate(graph, input, current.up, gateScratch, intermediate, inputSums, downSums, chunk,
-                                 scratch);
-    linear_.addPrefillResidual(graph, intermediate, current.down, from(residual, hidden_ * 2),
-                               from(output, hidden_ * 2), downSums, chunk, scratch);
-  }
-  if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
-  const uint64_t signal = ++value_;
-  graph.wait(event_, signal);
-  graph.add("ane_ffn_join", {output, evaluation.partial.buffer},
-            AneFfnJoinParams{hidden_, evaluation.partial.strideBytes / 2, rows}, {tiles, hidden_ / 32, 1}, {32, 8, 1});
-  jobs_.push_back({index, set, wait, signal});
+  const uint64_t wait = ++slot.value;
+  graph.signal(slot.event, wait);
+  linear_.addPrefill(graph, normalized, current.gate, gateScratch, sums, rows, scratch);
+  linear_.addPrefillUpWithGate(graph, normalized, current.up, gateScratch, intermediate, sums, downSums, rows,
+                               scratch);
+  linear_.addPrefillResidual(graph, intermediate, current.down, residual, output, downSums, rows, scratch);
+  // By the layer's last chunk every chunk has joined the layer before, whose
+  // weight set the next layer's takes.
+  if (chunk + 1 == chunks && layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
+  slot.pending = ++slot.value;
+  slot.output = output;
+  slot.rows = rows;
+  jobs_.push_back({chunk, set, wait, slot.pending});
 }
 
-void AneFfn::submit() {
-  std::vector<Job> jobs = std::exchange(jobs_, {});
-  for (const Job &job : jobs) {
-    try {
-      const Evaluation &evaluation = evaluations_[job.evaluation];
-      evaluation.program->enqueue(evaluation.bindings[job.set], evaluation.partial, event_, job.wait, job.signal,
-                                  [completions = completions_](bool success) {
-                                    std::lock_guard lock(completions->mutex);
-                                    ++completions->completed;
-                                    completions->failed |= !success;
-                                    completions->changed.notify_all();
-                                  });
-    } catch (...) {
-      static_cast<void>(wait(true));
-      throw;
+void AneFfn::addJoin(metal::CommandGraph &graph, uint32_t chunk) {
+  Slot &slot = slots_.at(chunk);
+  if (!slot.pending) return;
+  graph.wait(slot.event, slot.pending);
+  graph.add("ane_ffn_join", {slot.output, slot.partial.buffer},
+            AneFfnJoinParams{hidden_, slot.partial.strideBytes / 2, slot.rows}, {(slot.rows + 31) / 32, hidden_ / 32, 1},
+            {32, 8, 1});
+  slot.pending = 0;
+  slot.output = {};
+}
+
+// A command's number is the number of its last evaluation.
+uint64_t AneFfn::submit() {
+  std::unique_lock lock(queue_->mutex);
+  queue_->waiting.insert(queue_->waiting.end(), jobs_.begin(), jobs_.end());
+  queue_->submitted += jobs_.size();
+  jobs_.clear();
+  feed(lock);
+  return queue_->submitted;
+}
+
+// After an evaluation cannot be queued, the waiting ones never run: once
+// those running have completed, each one's event is raised to its signal so
+// that the Metal work waiting on it continues. A completion feeds only while
+// evaluations wait, so the AneFfn outlives the feeder.
+void AneFfn::feed(std::unique_lock<std::mutex> &lock) {
+  Queue &queue = *queue_;
+  if (std::exchange(queue.feeding, true)) return;
+  while (!queue.waiting.empty()) {
+    if (queue.abandoned) {
+      if (!queue.running.empty()) break;
+      for (const Job &job : queue.waiting) {
+        ane::Program::release(slots_[job.slot].event, job.signal);
+        queue.failures.push_back(++queue.completed);
+      }
+      queue.waiting.clear();
+      queue.abandoned = false;
+      queue.changed.notify_all();
+      break;
     }
-    queued_.push_back(job);
-    ++queuedCount_;
+    if (queue.running.size() >= kQueueWindow) break;
+    const Job job = queue.waiting.front();
+    queue.waiting.pop_front();
+    queue.running.push_back(job);
+    lock.unlock();
+    bool queued = true;
+    try {
+      const Slot &slot = slots_[job.slot];
+      program_->enqueue(slot.bindings[job.set], slot.partial, slot.event, job.wait, job.signal,
+                        [this, queue = queue_](bool success) {
+                          std::unique_lock lock(queue->mutex);
+                          queue->running.pop_front();
+                          if (!success) queue->failures.push_back(++queue->completed);
+                          else ++queue->completed;
+                          queue->changed.notify_all();
+                          if (!queue->waiting.empty()) feed(lock);
+                        });
+    } catch (...) {
+      queued = false;
+    }
+    lock.lock();
+    if (!queued) {
+      queue.running.pop_back();
+      queue.waiting.push_front(job);
+      queue.abandoned = true;
+    }
   }
+  queue.feeding = false;
 }
 
-void AneFfn::finish() {
-  if (!wait(false)) throw std::runtime_error("ANE FFN evaluations did not complete");
-  std::lock_guard lock(completions_->mutex);
-  if (std::exchange(completions_->failed, false)) throw std::runtime_error("ANE FFN evaluation failed");
+// The failures of earlier commands, finished or not, are dropped with the
+// command's.
+void AneFfn::finish(uint64_t command) {
+  std::unique_lock lock(queue_->mutex);
+  if (!wait(lock, command)) throw std::runtime_error("ANE FFN evaluations did not complete");
+  std::vector<uint64_t> &failures = queue_->failures;
+  const auto end = std::find_if(failures.begin(), failures.end(), [&](uint64_t number) { return number > command; });
+  const bool failed = end != failures.begin();
+  failures.erase(failures.begin(), end);
+  if (failed) throw std::runtime_error("ANE FFN evaluation failed");
 }
 
-bool AneFfn::wait(bool release) {
-  std::unique_lock lock(completions_->mutex);
-  const uint64_t first = queuedCount_ - queued_.size();
-  for (size_t index = 0; index < queued_.size(); ++index) {
-    const uint64_t sequence = first + index + 1;
-    if (release) ane::Program::release(event_, queued_[index].wait);
-    if (!completions_->changed.wait_for(lock, kCompletionTimeout,
-                                        [&] { return completions_->completed >= sequence; }))
+bool AneFfn::wait(std::unique_lock<std::mutex> &lock, uint64_t last) {
+  for (uint64_t seen = queue_->completed; queue_->completed < last; seen = queue_->completed)
+    if (!queue_->changed.wait_for(lock, kCompletionTimeout,
+                                  [&] { return queue_->completed >= last || queue_->completed != seen; }))
       return false;
-  }
-  queued_.clear();
   return true;
 }
 

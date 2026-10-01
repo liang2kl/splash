@@ -196,10 +196,9 @@ void requireLayerPartition(const QwenTargetGeometry &geometry, uint32_t gdnLayer
 
 } // namespace
 
-// The state a prefill command's layers share: its inputs and the next GDN,
-// attention and dense FFN layer of the step. A mixer chunk's step covers its
-// sequences' rows from rowBegin; its norm, projection sums and scratch rows
-// start at row 0.
+// The state a prefill command's layers share: its inputs and the next GDN and
+// attention layer of the step. A chunk's step covers its sequences' rows from
+// rowBegin; its norm, projection sums and scratch rows start at row 0.
 struct QwenTarget::PrefillStep {
   metal::CommandGraph &graph;
   const QwenTargetPrefillBuffers &buffers;
@@ -210,8 +209,15 @@ struct QwenTarget::PrefillStep {
   ops::AneFfn *aneFfn = nullptr;
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
-  uint32_t ffnLayer = 0;
   uint32_t rowBegin = 0;
+
+  // The step of the sequences [first, last), from the step's next layers.
+  [[nodiscard]] PrefillStep chunk(size_t first, size_t last) const {
+    uint32_t chunkRows = 0;
+    for (size_t index = first; index < last; ++index) chunkRows += sequences[index].rows;
+    return {graph,          buffers, sequences.subspan(first, last - first), chunkRows, kvLayers, moe, nullptr,
+            gdnLayer, attentionLayer, sequences[first].rowBegin};
+  }
 };
 
 struct QwenTarget::VerifyStep {
@@ -254,25 +260,76 @@ metal::MetalBuffer QwenTarget::addPrefill(
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
   if (rows >= ops::AneFfn::kMinimumRows) step.aneFfn = aneFfn;
   std::visit([&](const auto *weights) {
+    if constexpr (std::is_same_v<std::decay_t<decltype(weights->layers[0])>, Qwen3_8LayerWeights>)
+      if (step.aneFfn) return addPrefillSplit(step, weights->layers);
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
       const metal::MetalBuffer input = buffers.hidden[index & 1];
       const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
       const metal::MetalBuffer residual = std::visit(
-          [&](const auto &mixer) { return addPrefillMixers(step, mixer, layer.inputNorm, input); }, layer.mixer);
+          [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
       addPrefillFfn(step, layer, residual, output);
-      if (const auto slot = geometry_.captureSlot(index))
-        for (const QwenTargetPrefillSequence &sequence : sequences)
-          for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
-            const QwenTargetPrefillCapture &c = sequence.captures[capture];
-            ops::DraftAttention::captureTargetHidden(graph, output, buffers.captured, c.rows, *slot,
-                                                     c.sourceStart, c.destinationStart, geometry_.hiddenSize,
-                                                     geometry_.capturedHiddenSize());
-          }
+      addPrefillCaptures(step, index);
     }
   }, weights_);
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   return buffers.hidden[geometry_.layers & 1];
+}
+
+// Each chunk's layers interleave: a chunk joins its FFN of the layer before
+// just before its mixer, so the GPU runs the next chunk's mixer and the
+// following layer's weights while the ANE runs one chunk's FFN. A layer's
+// captures follow the next layer's chunks, by when every chunk has joined it.
+void QwenTarget::addPrefillSplit(PrefillStep &step, std::span<const Qwen3_8LayerWeights> layers) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  std::vector<std::pair<size_t, size_t>> chunks;
+  for (size_t first = 0, last = 0; first < step.sequences.size(); first = last) {
+    uint32_t rows = 0;
+    while (last < step.sequences.size() && rows + step.sequences[last].rows <= ExecutionLimits::prefillTokenBudget)
+      rows += step.sequences[last++].rows;
+    chunks.emplace_back(first, last);
+  }
+  for (uint32_t index = 0; index < geometry_.layers; ++index) {
+    const Qwen3_8LayerWeights &layer = layers[index];
+    const metal::MetalBuffer input = b.hidden[index & 1];
+    const metal::MetalBuffer output = b.hidden[(index & 1) ^ 1];
+    uint32_t gdnLayer = step.gdnLayer, attentionLayer = step.attentionLayer;
+    for (uint32_t c = 0; c < chunks.size(); ++c) {
+      step.aneFfn->addJoin(step.graph, c);
+      PrefillStep chunk = step.chunk(chunks[c].first, chunks[c].second);
+      const metal::MetalBuffer residual = rowsFrom(
+          backend_,
+          std::visit([&](const auto &mixer) {
+            return addPrefillMixer(chunk, mixer, layer.inputNorm,
+                                   rowsFrom(backend_, input, chunk.rowBegin, geometry_.hiddenSize));
+          }, layer.mixer),
+          chunk.rowBegin, geometry_.hiddenSize);
+      addPrefillNorm(chunk, residual, layer.postAttentionNorm, layer.gateProjection.layout());
+      step.aneFfn->add(step.graph, index, c, static_cast<uint32_t>(chunks.size()), b.normalized, b.projectionSums,
+                       b.denseGateScratch, b.denseIntermediate, b.downProjectionSums, residual,
+                       rowsFrom(backend_, output, chunk.rowBegin, geometry_.hiddenSize), chunk.rows, b.linearScratch);
+      gdnLayer = chunk.gdnLayer;
+      attentionLayer = chunk.attentionLayer;
+    }
+    step.gdnLayer = gdnLayer;
+    step.attentionLayer = attentionLayer;
+    if (index) addPrefillCaptures(step, index - 1);
+  }
+  for (uint32_t c = 0; c < chunks.size(); ++c) step.aneFfn->addJoin(step.graph, c);
+  addPrefillCaptures(step, geometry_.layers - 1);
+}
+
+void QwenTarget::addPrefillCaptures(PrefillStep &step, uint32_t layer) const {
+  const auto slot = geometry_.captureSlot(layer);
+  if (!slot) return;
+  const metal::MetalBuffer output = step.buffers.hidden[(layer & 1) ^ 1];
+  for (const QwenTargetPrefillSequence &sequence : step.sequences)
+    for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
+      const QwenTargetPrefillCapture &c = sequence.captures[capture];
+      ops::DraftAttention::captureTargetHidden(step.graph, output, step.buffers.captured, c.rows, *slot,
+                                               c.sourceStart, c.destinationStart, geometry_.hiddenSize,
+                                               geometry_.capturedHiddenSize());
+    }
 }
 
 // An affine prefill projection reads the Q4 input sums of its rows, which the
@@ -295,28 +352,6 @@ void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, 
     operators_.linear().addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
   operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, b.projectionSums,
                                          step.rows, b.linearScratch);
-}
-
-// The chunks of the step's sequences, each over its rows of `input`: the
-// returned output rows hold them all.
-template <class Mixer>
-metal::MetalBuffer QwenTarget::addPrefillMixers(PrefillStep &step, const Mixer &mixer, const ops::NormWeights &norm,
-                                                metal::MetalBuffer input) const {
-  metal::MetalBuffer output;
-  for (size_t first = 0, last = 0; first < step.sequences.size(); first = last) {
-    uint32_t rows = 0;
-    while (last < step.sequences.size() && rows + step.sequences[last].rows <= ExecutionLimits::prefillTokenBudget)
-      rows += step.sequences[last++].rows;
-    const uint32_t rowBegin = step.sequences[first].rowBegin;
-    PrefillStep chunk{step.graph, step.buffers, step.sequences.subspan(first, last - first), rows, step.kvLayers,
-                      step.moe, nullptr, step.gdnLayer, step.attentionLayer, step.ffnLayer, rowBegin};
-    output = addPrefillMixer(chunk, mixer, norm, rowsFrom(backend_, input, rowBegin, geometry_.hiddenSize));
-    if (last == step.sequences.size()) {
-      step.gdnLayer = chunk.gdnLayer;
-      step.attentionLayer = chunk.attentionLayer;
-    }
-  }
-  return output;
 }
 
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
@@ -396,13 +431,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
                                metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
-  const uint32_t index = step.ffnLayer++;
   addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
-  if (step.aneFfn) {
-    step.aneFfn->add(step.graph, index, b.normalized, b.projectionSums, b.denseGateScratch, b.denseIntermediate,
-                     b.downProjectionSums, residual, output, step.rows, b.linearScratch);
-    return;
-  }
   linear.addPrefill(step.graph, b.normalized, layer.gateProjection, b.denseGateScratch, b.projectionSums,
                     step.rows, b.linearScratch);
   linear.addPrefillUpWithGate(step.graph, b.normalized, layer.upProjection, b.denseGateScratch,

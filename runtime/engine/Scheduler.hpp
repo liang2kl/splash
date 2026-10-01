@@ -63,8 +63,7 @@ struct SchedulerSnapshot final {
 class Scheduler final {
 public:
   // A lone prefill request no peer waits on takes up to prefillBlockRows
-  // rows per command, others at most the model's token budget; a command of
-  // more than the budget takes more than prefillBlockRows less the budget.
+  // rows per command, others at most the model's token budget.
   explicit Scheduler(uint32_t prefillBlockRows = model::ExecutionLimits::prefillTokenBudget)
       : prefillBlockRows_(prefillBlockRows) {}
 

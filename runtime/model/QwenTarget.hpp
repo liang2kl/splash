@@ -302,11 +302,11 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows. Each
-  // layer's mixer runs over chunks of consecutive sequences of at most
-  // prefillTokenBudget rows, its FFN over all rows at once. The dense FFN of
-  // at least AneFfn::kMinimumRows rows runs split with the Neural Engine on
-  // `aneFfn`, when given; only it takes more than prefillTokenBudget rows.
+  // Returns the hidden buffer that holds the last layer's output rows. The
+  // dense FFN of a command of at least AneFfn::kMinimumRows rows runs split
+  // with the Neural Engine on `aneFfn`, when given, over chunks of
+  // consecutive sequences of at most prefillTokenBudget rows; only such a
+  // command takes more than prefillTokenBudget rows.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
@@ -338,9 +338,6 @@ private:
                       ops::WeightLayout consumer) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
-  template <class Mixer>
-  metal::MetalBuffer addPrefillMixers(PrefillStep &step, const Mixer &mixer, const ops::NormWeights &norm,
-                                      metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
                                      metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
@@ -349,6 +346,8 @@ private:
                      metal::MetalBuffer output) const;
   void addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
                      metal::MetalBuffer output) const;
+  void addPrefillSplit(PrefillStep &step, std::span<const Qwen3_8LayerWeights> layers) const;
+  void addPrefillCaptures(PrefillStep &step, uint32_t layer) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
                                     metal::MetalBuffer input) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,

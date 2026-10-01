@@ -289,12 +289,7 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
-    uint32_t rows = std::min(dispatchRemaining(view), budget);
-    // A block runs only with every one of its chunks: a shorter one would
-    // cost the model as much as a whole block.
-    if (rows > model::ExecutionLimits::prefillTokenBudget &&
-        rows <= budget - model::ExecutionLimits::prefillTokenBudget)
-      rows = model::ExecutionLimits::prefillTokenBudget;
+    const uint32_t rows = std::min(dispatchRemaining(view), budget);
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;
